@@ -1,5 +1,7 @@
 import sys
+import argparse
 import os, os.path
+from pathlib import Path
 from PIL import Image, ImageOps
 from multiprocessing import Process, Queue, cpu_count
 
@@ -9,8 +11,10 @@ TILE_MATCH_RES = 5		# tile matching resolution (higher values give better fit bu
 ENLARGEMENT    = 8		# the mosaic image will be this many times wider and taller than the original
 
 TILE_BLOCK_SIZE = TILE_SIZE / max(min(TILE_MATCH_RES, TILE_SIZE), 1)
-WORKER_COUNT = max(cpu_count() - 1, 1)
-OUT_FILE = 'mosaic.jpeg'
+WORKER_COUNT = min(max(cpu_count() - 1, 1), 2)
+# 使用脚本所在目录，VS Code 从不同目录运行也能找到示例素材。
+PROJECT_DIR = Path(__file__).resolve().parent
+OUT_FILE = PROJECT_DIR / 'output' / 'mosaic.jpeg'
 EOQ_VALUE = None
 
 class TileProcessor:
@@ -19,8 +23,8 @@ class TileProcessor:
 
 	def __process_tile(self, tile_path):
 		try:
-			img = Image.open(tile_path)
-			img = ImageOps.exif_transpose(img)
+			with Image.open(tile_path) as source:
+				img = ImageOps.exif_transpose(source).convert('RGB')
 
 			# tiles must be square, so get the largest square that fits inside the image
 			w = img.size[0]
@@ -34,7 +38,8 @@ class TileProcessor:
 			small_tile_img = img.resize((int(TILE_SIZE/TILE_BLOCK_SIZE), int(TILE_SIZE/TILE_BLOCK_SIZE)), Image.LANCZOS)
 
 			return (large_tile_img.convert('RGB'), small_tile_img.convert('RGB'))
-		except:
+		except (OSError, ValueError) as exc:
+			print('\nSkipping {}: {}'.format(tile_path, exc))
 			return (None, None)
 
 	def get_tiles(self):
@@ -45,7 +50,8 @@ class TileProcessor:
 
 		# search the tiles directory recursively
 		for root, subFolders, files in os.walk(self.tiles_directory):
-			for tile_name in files:
+			subFolders.sort()
+			for tile_name in sorted(files):
 				print('Reading {:40.40}'.format(tile_name), flush=True, end='\r')
 				tile_path = os.path.join(root, tile_name)
 				large_tile, small_tile = self.__process_tile(tile_path)
@@ -64,9 +70,12 @@ class TargetImage:
 
 	def get_data(self):
 		print('Processing main image...')
-		img = Image.open(self.image_path)
+		with Image.open(self.image_path) as source:
+			img = ImageOps.exif_transpose(source).convert('RGB')
 		w = img.size[0] * ENLARGEMENT
 		h = img.size[1]	* ENLARGEMENT
+		if min(w, h) < TILE_SIZE:
+			raise ValueError('Target image is too small: enlarged dimensions must be at least TILE_SIZE.')
 		large_img = img.resize((w, h), Image.LANCZOS)
 		w_diff = (w % TILE_SIZE)/2
 		h_diff = (h % TILE_SIZE)/2
@@ -75,6 +84,8 @@ class TargetImage:
 		if w_diff or h_diff:
 			large_img = large_img.crop((w_diff, h_diff, w - w_diff, h - h_diff))
 
+		# 裁剪后必须更新尺寸，保证每个 5×5 匹配块对应一个 50×50 拼图块。
+		w, h = large_img.size
 		small_img = large_img.resize((int(w/TILE_BLOCK_SIZE), int(h/TILE_BLOCK_SIZE)), Image.LANCZOS)
 
 		image_data = (large_img.convert('RGB'), small_img.convert('RGB'))
@@ -136,7 +147,7 @@ class ProgressCounter:
 
 	def update(self):
 		self.counter += 1
-		print("Progress: {:04.1f}%".format(100 * self.counter / self.total), flush=True, end='\r')
+		print("Tasks submitted: {:04.1f}%".format(100 * self.counter / self.total), flush=True, end='\r')
 
 class MosaicImage:
 	def __init__(self, original_img):
@@ -151,6 +162,7 @@ class MosaicImage:
 		self.image.paste(img, coords)
 
 	def save(self, path):
+		Path(path).parent.mkdir(parents=True, exist_ok=True)
 		self.image.save(path)
 
 def build_mosaic(result_queue, all_tile_data_large, original_img_large):
@@ -187,15 +199,15 @@ def compose(original_img, tiles):
 
 	work_queue   = Queue(WORKER_COUNT)	
 	result_queue = Queue()
+	workers = []
+	builder = Process(target=build_mosaic, args=(result_queue, all_tile_data_large, original_img_large))
+	builder.start()
+	for n in range(WORKER_COUNT):
+		worker = Process(target=fit_tiles, args=(work_queue, result_queue, all_tile_data_small))
+		worker.start()
+		workers.append(worker)
 
 	try:
-		# start the worker processes that will build the mosaic image
-		Process(target=build_mosaic, args=(result_queue, all_tile_data_large, original_img_large)).start()
-
-		# start the worker processes that will perform the tile fitting
-		for n in range(WORKER_COUNT):
-			Process(target=fit_tiles, args=(work_queue, result_queue, all_tile_data_small)).start()
-
 		progress = ProgressCounter(mosaic.x_tile_count * mosaic.y_tile_count)
 		for x in range(mosaic.x_tile_count):
 			for y in range(mosaic.y_tile_count):
@@ -211,6 +223,18 @@ def compose(original_img, tiles):
 		# put these special values onto the queue to let the workers know they can terminate
 		for n in range(WORKER_COUNT):
 			work_queue.put((EOQ_VALUE, EOQ_VALUE))
+		# 等待所有匹配及保存完成，终端结束后就可以打开结果。
+		for worker in workers:
+			worker.join()
+		if any(worker.exitcode != 0 for worker in workers):
+			builder.terminate()
+			builder.join()
+			raise RuntimeError('A tile matching process failed.')
+		builder.join()
+		if builder.exitcode != 0:
+			raise RuntimeError('The mosaic could not be saved.')
+		work_queue.close()
+		result_queue.close()
 
 def show_error(msg):
 	print('ERROR: {}'.format(msg))
@@ -221,17 +245,23 @@ def mosaic(img_path, tiles_path):
 	if tiles_data[0]:
 		compose(image_data, tiles_data)
 	else:
-		show_error("No images found in tiles directory '{}'".format(tiles_path))
+		raise ValueError("No images found in tiles directory '{}'".format(tiles_path))
+
+def main():
+	parser = argparse.ArgumentParser(description='Build a photo mosaic; without arguments, run the included flower demo.')
+	parser.add_argument('image', nargs='?', default=str(PROJECT_DIR / 'data' / 'target.jpg'))
+	parser.add_argument('tiles', nargs='?', default=str(PROJECT_DIR / 'data' / 'tiles'))
+	args = parser.parse_args()
+	try:
+		if not os.path.isfile(args.image):
+			raise FileNotFoundError("Unable to find image file '{}'".format(args.image))
+		if not os.path.isdir(args.tiles):
+			raise FileNotFoundError("Unable to find tile directory '{}'".format(args.tiles))
+		mosaic(args.image, args.tiles)
+	except (OSError, ValueError, RuntimeError) as exc:
+		show_error(str(exc))
+		return 1
+	return 0
 
 if __name__ == '__main__':
-	if len(sys.argv) < 3:
-		show_error('Usage: {} <image> <tiles directory>\r'.format(sys.argv[0]))
-	else:
-		source_image = sys.argv[1]
-		tile_dir = sys.argv[2]
-		if not os.path.isfile(source_image):
-			show_error("Unable to find image file '{}'".format(source_image))
-		elif not os.path.isdir(tile_dir):
-			show_error("Unable to find tile directory '{}'".format(tile_dir))
-		else:
-			mosaic(source_image, tile_dir)
+	sys.exit(main())
